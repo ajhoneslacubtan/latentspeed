@@ -39,3 +39,4 @@ feeds:
     snapshot_interval: 1   # seconds (legacy)
     reconnect_attempts: 10
     reconnect_delay_ms: 5000
+    # subscription_delay_ms: 250  # Increase for large symbol counts (50+) to avoid rate limits (default: 100)

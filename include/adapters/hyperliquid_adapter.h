@@ -104,7 +104,7 @@ private:
     bool disable_private_ws_{false};
     bool subscribe_connected_{false};  // Track subscribe connection state independently
     int ws_post_timeout_ms_{1500};
-    bool ws_first_{false};  // Prefer WS post for actions when true (HTTP fallback)
+    bool ws_first_{true};  // Prefer WS post for actions when true (HTTP fallback)
     uint64_t private_ws_connected_ms_{0};
 
     // Batching and rate-limit controls

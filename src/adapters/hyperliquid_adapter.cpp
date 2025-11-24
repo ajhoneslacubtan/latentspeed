@@ -295,6 +295,7 @@ bool HyperliquidAdapter::initialize(const std::string& api_key,
         std::string s(f); for (auto& c: s) c = (char)std::tolower(c);
         ws_first_ = (s == "1" || s == "true" || s == "yes");
     }
+    try { spdlog::info("[HL] action transport: ws_first={} (set LATENTSPEED_HL_ACTION_WS_FIRST to override)", (ws_first_ ? "true" : "false")); } catch (...) {}
     // Private WS liveness env overrides (optional)
     if (const char* e = std::getenv("LATENTSPEED_HL_RESUBSCRIBE_QUIET_MS"); e && *e) {
         try { resubscribe_quiet_ms_ = std::max<uint64_t>(5000, static_cast<uint64_t>(std::stoll(e))); } catch (...) {}

@@ -30,7 +30,10 @@ void FeedHandler::add_feed(
     entry.provider = std::make_unique<MarketDataProvider>(
         exchange_config.name,
         exchange_config.symbols,
-        entry.exchange.get()  // Pass exchange interface
+        entry.exchange.get(),  // Pass exchange interface
+        exchange_config.reconnect_attempts,
+        exchange_config.reconnect_delay_ms,
+        exchange_config.subscription_delay_ms
     );
     // Configure provider outputs from handler config (snapshot vs delta/ckpt)
     try {
@@ -178,7 +181,11 @@ ConfigLoader::LoadedConfig ConfigLoader::load_from_yaml(const std::string& path)
                 if (feed_node["snapshot_interval"]) {
                     exchange_config.snapshot_interval = feed_node["snapshot_interval"].as<int>();
                 }
-                
+
+                if (feed_node["subscription_delay_ms"]) {
+                    exchange_config.subscription_delay_ms = feed_node["subscription_delay_ms"].as<int>();
+                }
+
                 result.feeds.push_back(exchange_config);
                 
                 spdlog::info("[ConfigLoader] Loaded feed: {} with {} symbols",

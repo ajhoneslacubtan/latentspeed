@@ -167,10 +167,16 @@ public:
      * @param exchange Exchange name (e.g., "bybit", "binance")
      * @param symbols List of symbols to subscribe
      * @param exchange_interface Optional exchange interface (for multi-exchange support)
+     * @param reconnect_attempts Max reconnection attempts (default: 10)
+     * @param reconnect_delay_ms Delay between reconnection attempts (default: 5000ms)
+     * @param subscription_delay_ms Delay between individual subscriptions for rate limiting (default: 100ms)
      */
-    MarketDataProvider(const std::string& exchange, 
+    MarketDataProvider(const std::string& exchange,
                       const std::vector<std::string>& symbols,
-                      ExchangeInterface* exchange_interface = nullptr);
+                      ExchangeInterface* exchange_interface = nullptr,
+                      int reconnect_attempts = 10,
+                      int reconnect_delay_ms = 5000,
+                      int subscription_delay_ms = 100);
     
     /**
      * @brief Destructor
@@ -241,10 +247,39 @@ private:
     
     /**
      * @brief WebSocket connection management
+     * @return true if connection successful, false otherwise
      */
-    void connect_websocket();
+    bool connect_websocket();
     void handle_websocket_message(const std::string& message);
     void send_subscription();
+
+    /**
+     * @brief Async WebSocket read handler
+     */
+    void async_read_message();
+
+    /**
+     * @brief Send ping message to exchange
+     */
+    void send_ping();
+
+    /**
+     * @brief Setup ping timer for periodic pings
+     */
+    void setup_ping_timer();
+
+    /**
+     * @brief Cleanup WebSocket connection and related resources
+     */
+    void cleanup_connection();
+
+    /**
+     * @brief Calculate exponential backoff delay
+     * @param attempt Current reconnection attempt number (0-based)
+     * @param base_delay_ms Base delay in milliseconds
+     * @return Delay in milliseconds with exponential backoff and jitter
+     */
+    uint32_t calculate_backoff_delay(uint32_t attempt, int base_delay_ms);
     
     /**
      * @brief Exchange-specific message parsing
@@ -305,6 +340,21 @@ private:
     std::unique_ptr<WSStream> ws_stream_;
     std::unique_ptr<std::thread> ws_thread_;
     WSBuffer ws_buffer_;
+
+    // Ping/pong management
+    std::unique_ptr<boost::asio::steady_timer> ping_timer_;
+    std::chrono::steady_clock::time_point last_message_time_;
+    std::chrono::steady_clock::time_point last_ping_time_;
+    std::mutex ping_mutex_;
+
+    // Reconnection management
+    std::atomic<bool> reconnecting_{false};
+    std::atomic<uint32_t> reconnect_attempts_{0};
+    std::atomic<bool> ws_connected_{false};
+    int max_reconnect_attempts_{10};
+    int reconnect_delay_ms_{5000};
+    int subscription_delay_ms_{100};
+    std::chrono::steady_clock::time_point last_reconnect_attempt_;
     
     // ZMQ components
     std::unique_ptr<zmq::context_t> zmq_context_;

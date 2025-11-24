@@ -14,6 +14,7 @@
 #include <chrono>
 #include <set>
 #include <limits>
+#include <random>
 
 #ifdef __linux__
 #include <pthread.h>
@@ -22,15 +23,22 @@
 
 namespace latentspeed {
 
-MarketDataProvider::MarketDataProvider(const std::string& exchange, 
+MarketDataProvider::MarketDataProvider(const std::string& exchange,
                                      const std::vector<std::string>& symbols,
-                                     ExchangeInterface* exchange_interface)
+                                     ExchangeInterface* exchange_interface,
+                                     int reconnect_attempts,
+                                     int reconnect_delay_ms,
+                                     int subscription_delay_ms)
     : exchange_(exchange)
     , symbols_(symbols)
     , running_(false)
-    , exchange_interface_(exchange_interface) {
-    
-    spdlog::info("[MarketData] Initializing provider for exchange: {}", exchange_);
+    , exchange_interface_(exchange_interface)
+    , max_reconnect_attempts_(reconnect_attempts)
+    , reconnect_delay_ms_(reconnect_delay_ms)
+    , subscription_delay_ms_(subscription_delay_ms) {
+
+    spdlog::info("[MarketData] Initializing provider for exchange: {} (reconnect: {} attempts, {} ms delay, subscription: {} ms delay)",
+                 exchange_, max_reconnect_attempts_, reconnect_delay_ms_, subscription_delay_ms_);
     
     // Initialize memory pools
     tick_pool_ = std::make_unique<hft::MemoryPool<MarketTick, 1024>>();
@@ -107,8 +115,21 @@ void MarketDataProvider::start() {
         return;
     }
     
-    spdlog::info("[MarketData] Starting market data provider...");
-    
+    spdlog::info("[MarketData] Starting market data provider for {} symbols", symbols_.size());
+
+    // Log subscribed symbols (first 5)
+    {
+        std::string symbols_str;
+        for (size_t i = 0; i < std::min(symbols_.size(), size_t(5)); ++i) {
+            if (i > 0) symbols_str += ", ";
+            symbols_str += symbols_[i];
+        }
+        if (symbols_.size() > 5) {
+            symbols_str += " (+" + std::to_string(symbols_.size() - 5) + " more)";
+        }
+        spdlog::info("[MarketData] Symbols: {}", symbols_str);
+    }
+
     // Start WebSocket thread
     ws_thread_ = std::make_unique<std::thread>(&MarketDataProvider::websocket_thread, this);
     
@@ -197,26 +218,120 @@ void MarketDataProvider::configure_outputs(bool emit_snapshot, bool emit_delta, 
 
 void MarketDataProvider::websocket_thread() {
     spdlog::info("[MarketData] WebSocket thread started");
-    
-    try {
-        connect_websocket();
-        
-        // Run the I/O context
-        io_context_->run();
-        
-    } catch (const std::exception& e) {
-        spdlog::error("[MarketData] WebSocket thread error: {}", e.what());
-        stats_.errors.fetch_add(1);
-        if (callbacks_) {
-            callbacks_->on_error("WebSocket error: " + std::string(e.what()));
+
+    uint32_t backoff_attempt = 0;
+
+    while (running_.load() && backoff_attempt <= max_reconnect_attempts_) {
+        try {
+            // Connect (TCP + SSL + WS handshake + subscribe)
+            if (!connect_websocket()) {
+                spdlog::warn("[MarketData] Connection failed, will retry...");
+                goto retry_with_backoff;
+            }
+
+            // Reset reconnection state on successful connection
+            if (backoff_attempt > 0) {
+                spdlog::info("[MarketData] Successfully reconnected after {} attempt(s)", backoff_attempt);
+            }
+            backoff_attempt = 0;
+            reconnect_attempts_.store(0);
+
+            // Initialize ping timer if exchange requires pings
+            if (exchange_interface_ && exchange_interface_->get_ping_interval_seconds() > 0) {
+                ping_timer_ = std::make_unique<boost::asio::steady_timer>(*io_context_);
+                last_message_time_ = std::chrono::steady_clock::now();
+                last_ping_time_ = std::chrono::steady_clock::now();
+                setup_ping_timer();
+                spdlog::info("[MarketData] Ping timer initialized (interval: {}s)",
+                            exchange_interface_->get_ping_interval_seconds());
+            }
+
+            // Start async read
+            async_read_message();
+
+            // Run the I/O context (blocks until error or stop)
+            io_context_->run();
+
+            // If we get here, connection was closed (expected or error)
+            spdlog::info("[MarketData] io_context run() exited, cleaning up...");
+            cleanup_connection();
+
+        } catch (const std::exception& e) {
+            spdlog::error("[MarketData] WebSocket thread error: {}", e.what());
+            stats_.errors.fetch_add(1);
+            if (callbacks_) {
+                callbacks_->on_error("WebSocket error: " + std::string(e.what()));
+            }
+            cleanup_connection();
         }
+
+    retry_with_backoff:
+        // Check if we should stop
+        if (!running_.load()) {
+            spdlog::info("[MarketData] Shutting down, not reconnecting");
+            break;
+        }
+
+        // Check if we've exceeded max attempts
+        if (backoff_attempt >= max_reconnect_attempts_) {
+            spdlog::error("[MarketData] Max reconnection attempts ({}) reached, giving up",
+                         max_reconnect_attempts_);
+            if (callbacks_) {
+                callbacks_->on_error("Max reconnection attempts exceeded");
+            }
+            break;
+        }
+
+        // Calculate exponential backoff delay
+        uint32_t delay_ms = calculate_backoff_delay(backoff_attempt, reconnect_delay_ms_);
+        spdlog::info("[MarketData] Reconnecting in {} ms (attempt {}/{})",
+                     delay_ms, backoff_attempt + 1, max_reconnect_attempts_);
+
+        reconnect_attempts_.store(backoff_attempt + 1);
+        last_reconnect_attempt_ = std::chrono::steady_clock::now();
+
+        // Wait with periodic check for shutdown signal
+        auto wait_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(delay_ms);
+        while (running_.load() && std::chrono::steady_clock::now() < wait_until) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!running_.load()) {
+            spdlog::info("[MarketData] Shutdown requested during backoff, exiting");
+            break;
+        }
+
+        backoff_attempt++;
     }
-    
+
     spdlog::info("[MarketData] WebSocket thread stopped");
 }
 
-void MarketDataProvider::connect_websocket() {
+bool MarketDataProvider::connect_websocket() {
+    std::lock_guard<std::mutex> lock(connection_mutex_);
+
+    spdlog::info("[MarketData] Starting WebSocket connection...");
+
+    // Cleanup previous connection if exists
+    if (ws_stream_) {
+        spdlog::debug("[MarketData] Cleaning up previous WebSocket connection");
+        try {
+            ws_stream_->close(boost::beast::websocket::close_code::normal);
+        } catch (const std::exception& e) {
+            spdlog::debug("[MarketData] Error closing previous connection: {}", e.what());
+        }
+        ws_stream_.reset();
+    }
+
+    // Reset io_context if stopped
+    if (io_context_ && io_context_->stopped()) {
+        spdlog::debug("[MarketData] Restarting stopped io_context");
+        io_context_->restart();
+    }
+
     std::string host, port, target;
+
+    try {
     
     // Use exchange interface if available, otherwise fallback to hardcoded
     if (exchange_interface_) {
@@ -275,53 +390,214 @@ void MarketDataProvider::connect_websocket() {
     // Send subscription
     spdlog::info("[MarketData] Sending subscription message...");
     send_subscription();
-    spdlog::info("[MarketData] Starting message read loop...");
-    
-    // Start reading messages
-    int message_count = 0;
-    while (running_.load()) {
+    spdlog::info("[MarketData] WebSocket connection established, ready for async reads");
+
+    ws_connected_.store(true);
+    return true;
+
+    } catch (const std::exception& e) {
+        spdlog::error("[MarketData] WebSocket connection failed: {}", e.what());
+        stats_.errors.fetch_add(1);
+        ws_connected_.store(false);
+        return false;
+    }
+}
+
+void MarketDataProvider::cleanup_connection() {
+    spdlog::info("[MarketData] Cleaning up WebSocket connection");
+
+    ws_connected_.store(false);
+
+    // Cancel ping timer
+    if (ping_timer_) {
         try {
-            ws_buffer_.clear();
-            ws_stream_->read(ws_buffer_);
-            message_count++;
-            
+            ping_timer_->cancel();
+        } catch (const std::exception& e) {
+            spdlog::debug("[MarketData] Error canceling ping timer: {}", e.what());
+        }
+        ping_timer_.reset();
+    }
+
+    // Close WebSocket gracefully
+    if (ws_stream_) {
+        try {
+            ws_stream_->close(boost::beast::websocket::close_code::normal);
+        } catch (const std::exception& e) {
+            spdlog::debug("[MarketData] Error closing WebSocket: {}", e.what());
+        }
+    }
+
+    // Stop io_context to break out of run() loop
+    if (io_context_ && !io_context_->stopped()) {
+        io_context_->stop();
+    }
+
+    spdlog::debug("[MarketData] Connection cleanup complete");
+}
+
+uint32_t MarketDataProvider::calculate_backoff_delay(uint32_t attempt, int base_delay_ms) {
+    // Exponential backoff: base_delay * 2^attempt, capped at 120 seconds
+    constexpr uint32_t MAX_DELAY_MS = 120000;  // 2 minutes max
+
+    uint32_t delay_ms = base_delay_ms * (1 << std::min(attempt, 5u));  // Cap exponent at 2^5 = 32
+    delay_ms = std::min(delay_ms, MAX_DELAY_MS);
+
+    // Add jitter (±10%) to prevent thundering herd
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<> jitter(-delay_ms / 10, delay_ms / 10);
+
+    delay_ms += jitter(gen);
+
+    return delay_ms;
+}
+
+void MarketDataProvider::async_read_message() {
+    if (!running_.load()) {
+        return;
+    }
+
+    ws_buffer_.clear();
+    ws_stream_->async_read(
+        ws_buffer_,
+        [this](boost::beast::error_code ec, std::size_t bytes_transferred) {
+            if (ec) {
+                if (ec != boost::beast::websocket::error::closed) {
+                    spdlog::error("[MarketData] WebSocket async_read error: {}", ec.message());
+                    stats_.errors.fetch_add(1);
+                    if (callbacks_) {
+                        callbacks_->on_error("WebSocket error: " + ec.message());
+                    }
+                }
+                // Stop io_context on error
+                io_context_->stop();
+                return;
+            }
+
+            // Update last message time
+            {
+                std::lock_guard<std::mutex> lock(ping_mutex_);
+                last_message_time_ = std::chrono::steady_clock::now();
+            }
+
+            // Process received message
             std::string message = boost::beast::buffers_to_string(ws_buffer_.data());
-            spdlog::debug("[MarketData] Received message #{}: {}", message_count, message.substr(0, 200));
-            
+            spdlog::trace("[MarketData] Received message ({} bytes): {}",
+                         bytes_transferred, message.substr(0, 200));
+
+            // Check if this is a pong response
+            if (exchange_interface_ && exchange_interface_->is_pong_message(message)) {
+                spdlog::trace("[MarketData] Received pong from {}", exchange_interface_->get_name());
+                // Continue reading
+                async_read_message();
+                return;
+            }
+
             // Skip heartbeat messages early to save processing
-            if (message.find("-heartbeat") != std::string::npos || 
+            if (message.find("-heartbeat") != std::string::npos ||
                 message.find("heartbeat") != std::string::npos) {
                 spdlog::trace("[MarketData] Skipping heartbeat message");
-                continue;
+                async_read_message();
+                return;
             }
-            
+
             // Copy message to fixed-size buffer for lock-free queue
             MessageBuffer msg_buffer;
             size_t copy_size = std::min(message.size(), msg_buffer.size() - 1);
-            
+
             // Warn if message is truncated
             if (message.size() >= msg_buffer.size()) {
-                spdlog::warn("[MarketData] Message too large ({} bytes), truncating to {} bytes", 
+                spdlog::warn("[MarketData] Message too large ({} bytes), truncating to {} bytes",
                            message.size(), msg_buffer.size() - 1);
             }
-            
+
             std::memcpy(msg_buffer.data(), message.c_str(), copy_size);
             msg_buffer[copy_size] = '\0';
-            
+
             // Push to processing queue
             if (!message_queue_->try_push(msg_buffer)) {
                 spdlog::warn("[MarketData] Message queue full, dropping message");
                 stats_.errors.fetch_add(1);
             }
-            
-        } catch (const boost::beast::system_error& se) {
-            if (se.code() != boost::beast::websocket::error::closed) {
-                spdlog::error("[MarketData] WebSocket read error: {}", se.what());
-                stats_.errors.fetch_add(1);
-            }
-            break;
+
+            // Continue reading
+            async_read_message();
         }
+    );
+}
+
+void MarketDataProvider::send_ping() {
+    if (!exchange_interface_ || !running_.load()) {
+        return;
     }
+
+    std::string ping_msg = exchange_interface_->generate_ping();
+    if (ping_msg.empty()) {
+        return;
+    }
+
+    try {
+        ws_stream_->write(boost::asio::buffer(ping_msg));
+
+        {
+            std::lock_guard<std::mutex> lock(ping_mutex_);
+            last_ping_time_ = std::chrono::steady_clock::now();
+        }
+
+        spdlog::trace("[MarketData] Sent ping to {}", exchange_interface_->get_name());
+    } catch (const std::exception& e) {
+        spdlog::warn("[MarketData] Failed to send ping: {}", e.what());
+        stats_.errors.fetch_add(1);
+    }
+}
+
+void MarketDataProvider::setup_ping_timer() {
+    if (!ping_timer_ || !exchange_interface_ || !running_.load()) {
+        return;
+    }
+
+    int ping_interval = exchange_interface_->get_ping_interval_seconds();
+    if (ping_interval <= 0) {
+        return;
+    }
+
+    ping_timer_->expires_after(std::chrono::seconds(ping_interval));
+    ping_timer_->async_wait(
+        [this, ping_interval](boost::beast::error_code ec) {
+            if (ec || !running_.load()) {
+                return;
+            }
+
+            // Send ping
+            send_ping();
+
+            // Check for stale connection (no messages received in 3x ping interval)
+            {
+                std::lock_guard<std::mutex> lock(ping_mutex_);
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed_since_msg = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - last_message_time_).count();
+
+                if (elapsed_since_msg > (ping_interval * 3)) {
+                    spdlog::warn("[MarketData] No messages received for {} seconds, triggering reconnect",
+                               elapsed_since_msg);
+                    stats_.errors.fetch_add(1);
+                    if (callbacks_) {
+                        callbacks_->on_error("Stale connection detected, reconnecting...");
+                    }
+
+                    // Trigger reconnect by stopping io_context
+                    // This will cause io_context_->run() to return in websocket_thread()
+                    // which will then enter the reconnection loop
+                    io_context_->stop();
+                    return;  // Exit ping timer
+                }
+            }
+
+            // Reschedule timer
+            setup_ping_timer();
+        }
+    );
 }
 
 void MarketDataProvider::processing_thread() {
@@ -342,9 +618,9 @@ void MarketDataProvider::processing_thread() {
                     OrderBookSnapshot snapshot;
                     
                     auto msg_type = exchange_interface_->parse_message(message_str, tick, snapshot);
-                    
+
                     // Log message type for debugging
-                    spdlog::debug("[MarketData] Parsed message type: {} (msg: {})", 
+                    spdlog::trace("[MarketData] Parsed message type: {} (msg: {})",
                                  static_cast<int>(msg_type), message_str.substr(0, 100));
                     
                     if (msg_type == ExchangeInterface::MessageType::TRADE) {
@@ -394,10 +670,10 @@ void MarketDataProvider::processing_thread() {
                         stats_.orderbooks_processed.fetch_add(1);
                     }
                     else if (msg_type == ExchangeInterface::MessageType::HEARTBEAT) {
-                        spdlog::debug("[MarketData] Received heartbeat/subscription message");
+                        spdlog::trace("[MarketData] Received heartbeat/subscription message");
                     }
                     else if (msg_type == ExchangeInterface::MessageType::UNKNOWN) {
-                        spdlog::warn("[MarketData] Unknown message type: {}", message_str.substr(0, 200));
+                        spdlog::debug("[MarketData] Unknown message type: {}", message_str.substr(0, 200));
                     }
                     else if (msg_type == ExchangeInterface::MessageType::ERROR) {
                         spdlog::error("[MarketData] Error parsing message: {}", message_str.substr(0, 200));
@@ -467,32 +743,47 @@ void MarketDataProvider::publishing_thread() {
 
 void MarketDataProvider::send_subscription() {
     std::string sub_msg = build_subscription_message();
-    
-    spdlog::info("[MarketData] Subscription message: {}", sub_msg);
-    
+
+    spdlog::debug("[MarketData] Subscription message: {}", sub_msg);
+
     try {
         // For dYdX and Hyperliquid, the subscription message is a JSON array of individual subscriptions
         // We need to send each one separately
-        if (exchange_interface_ && 
+        if (exchange_interface_ &&
             (exchange_interface_->get_name() == "DYDX" || exchange_interface_->get_name() == "HYPERLIQUID")) {
             rapidjson::Document doc;
             doc.Parse(sub_msg.c_str());
-            
+
             if (doc.IsArray()) {
+                size_t total_subs = doc.GetArray().Size();
+
+                // Warn about large subscription counts
+                if (total_subs > 50) {
+                    spdlog::warn("[MarketData] Subscribing to {} channels - this may take {}+ seconds due to rate limits",
+                                total_subs, (total_subs * subscription_delay_ms_) / 1000);
+                }
+
+                size_t count = 0;
                 for (auto& sub : doc.GetArray()) {
                     rapidjson::StringBuffer buffer;
                     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
                     sub.Accept(writer);
-                    
+
                     std::string individual_sub = buffer.GetString();
                     size_t bytes = ws_stream_->write(boost::asio::buffer(individual_sub));
-                    spdlog::info("[MarketData] Sent {} subscription ({} bytes): {}", 
+
+                    count++;
+                    if (count % 20 == 0 || count == total_subs) {
+                        spdlog::info("[MarketData] Subscription progress: {}/{}", count, total_subs);
+                    }
+
+                    spdlog::debug("[MarketData] Sent {} subscription ({} bytes): {}",
                                 exchange_interface_->get_name(), bytes, individual_sub);
-                    
-                    // Small delay between subscriptions
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+                    // Configurable delay between subscriptions to avoid rate limiting
+                    std::this_thread::sleep_for(std::chrono::milliseconds(subscription_delay_ms_));
                 }
-                spdlog::info("[MarketData] All {} subscriptions sent", exchange_interface_->get_name());
+                spdlog::info("[MarketData] All {} subscriptions sent successfully", exchange_interface_->get_name());
                 return;
             }
         }

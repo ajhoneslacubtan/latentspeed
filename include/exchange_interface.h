@@ -34,6 +34,7 @@ struct ExchangeConfig {
     // Connection settings
     int reconnect_attempts = 10;         ///< Max reconnection attempts
     int reconnect_delay_ms = 5000;       ///< Delay between reconnections
+    int subscription_delay_ms = 100;     ///< Delay between individual subscriptions (rate limit mitigation)
     
     ExchangeConfig() = default;
     ExchangeConfig(const std::string& n, const std::vector<std::string>& s)
@@ -98,6 +99,25 @@ public:
      * @return Normalized symbol for this exchange
      */
     virtual std::string normalize_symbol(const std::string& symbol) const = 0;
+
+    /**
+     * @brief Get ping interval for this exchange (in seconds)
+     * @return Ping interval in seconds (0 = no ping needed)
+     */
+    virtual int get_ping_interval_seconds() const { return 0; }
+
+    /**
+     * @brief Generate ping message for this exchange
+     * @return JSON ping message (empty string if not needed)
+     */
+    virtual std::string generate_ping() const { return ""; }
+
+    /**
+     * @brief Check if message is a pong response
+     * @param message Raw message from exchange
+     * @return true if message is a pong response
+     */
+    virtual bool is_pong_message(const std::string& message) const { return false; }
 };
 
 /**
@@ -273,14 +293,14 @@ public:
         // Hyperliquid uses simple coin symbols: BTC, ETH, SOL
         // Remove common suffixes and convert to uppercase
         std::string normalized = symbol;
-        
+
         // Remove separators
-        normalized.erase(std::remove(normalized.begin(), normalized.end(), '-'), 
+        normalized.erase(std::remove(normalized.begin(), normalized.end(), '-'),
                         normalized.end());
-        
+
         // Convert to uppercase
         std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::toupper);
-        
+
         // Remove USDT/USD/PERP suffixes if present
         size_t usdt_pos = normalized.find("USDT");
         if (usdt_pos != std::string::npos) {
@@ -291,13 +311,35 @@ public:
                 normalized = normalized.substr(0, usd_pos);
             }
         }
-        
+
         size_t perp_pos = normalized.find("PERP");
         if (perp_pos != std::string::npos) {
             normalized = normalized.substr(0, perp_pos);
         }
-        
+
         return normalized;
+    }
+
+    /**
+     * @brief Hyperliquid requires pings every 20 seconds to keep connection alive
+     */
+    int get_ping_interval_seconds() const override {
+        return 20;
+    }
+
+    /**
+     * @brief Generate Hyperliquid ping message
+     */
+    std::string generate_ping() const override {
+        return "{\"method\":\"ping\"}";
+    }
+
+    /**
+     * @brief Check if message is Hyperliquid pong response
+     */
+    bool is_pong_message(const std::string& message) const override {
+        // Hyperliquid responds with {"channel":"pong"}
+        return message.find("\"channel\":\"pong\"") != std::string::npos;
     }
 };
 

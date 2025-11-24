@@ -43,14 +43,14 @@ void signal_handler(int signum) {
 class MarketStreamCallback : public MarketDataCallbacks {
 public:
     void on_trade(const MarketTick& tick) override {
-        spdlog::info("[TRADE] {}:{} @ ${:.2f} x {:.4f} {}",
-                     tick.exchange.c_str(), tick.symbol.c_str(), 
+        spdlog::debug("[TRADE] {}:{} @ ${:.2f} x {:.4f} {}",
+                     tick.exchange.c_str(), tick.symbol.c_str(),
                      tick.price, tick.amount, tick.side.c_str());
         trade_count_++;
     }
-    
+
     void on_orderbook(const OrderBookSnapshot& snapshot) override {
-        spdlog::info("[BOOK] {}:{} - Mid: ${:.2f} Spread: {:.2f} bps",
+        spdlog::debug("[BOOK] {}:{} - Mid: ${:.2f} Spread: {:.2f} bps",
                      snapshot.exchange.c_str(), snapshot.symbol.c_str(),
                      snapshot.midpoint,
                      snapshot.relative_spread * 10000);
