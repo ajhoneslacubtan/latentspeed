@@ -24,6 +24,9 @@
 #include <signal.h>
 #include <fstream>
 #include <iostream>
+#include <array>
+#include <algorithm>
+#include <vector>
 
 using namespace latentspeed;
 
@@ -39,6 +42,77 @@ void signal_handler(int signum) {
     }
 }
 
+// Lock-free latency tracker using circular buffer
+class LatencyTracker {
+public:
+    LatencyTracker() : write_idx_(0) {
+        samples_.fill(0);
+    }
+
+    // Lock-free: record latency (called from hot path)
+    void record(uint64_t latency_ns) {
+        // Use relaxed ordering for maximum performance
+        uint32_t idx = write_idx_.fetch_add(1, std::memory_order_relaxed) % BUFFER_SIZE;
+        samples_[idx] = latency_ns;
+    }
+
+    // Compute statistics (called from stats thread, NOT in hot path)
+    struct Stats {
+        uint64_t min_us = 0;
+        uint64_t max_us = 0;
+        uint64_t p50_us = 0;
+        uint64_t p95_us = 0;
+        uint64_t p99_us = 0;
+        double avg_us = 0.0;
+        uint32_t count = 0;
+    };
+
+    Stats compute_stats() {
+        Stats stats;
+        std::vector<uint64_t> sorted_samples;
+        sorted_samples.reserve(BUFFER_SIZE);
+
+        // Copy samples to local vector
+        uint32_t current_idx = write_idx_.load(std::memory_order_relaxed);
+        for (uint32_t i = 0; i < BUFFER_SIZE; ++i) {
+            uint64_t sample = samples_[i];
+            if (sample > 0) {  // Skip uninitialized slots
+                sorted_samples.push_back(sample);
+            }
+        }
+
+        if (sorted_samples.empty()) {
+            return stats;
+        }
+
+        stats.count = sorted_samples.size();
+
+        // Sort for percentile calculation
+        std::sort(sorted_samples.begin(), sorted_samples.end());
+
+        // Convert to microseconds
+        stats.min_us = sorted_samples.front() / 1000;
+        stats.max_us = sorted_samples.back() / 1000;
+        stats.p50_us = sorted_samples[sorted_samples.size() * 50 / 100] / 1000;
+        stats.p95_us = sorted_samples[sorted_samples.size() * 95 / 100] / 1000;
+        stats.p99_us = sorted_samples[sorted_samples.size() * 99 / 100] / 1000;
+
+        // Compute average
+        uint64_t sum = 0;
+        for (uint64_t sample : sorted_samples) {
+            sum += sample;
+        }
+        stats.avg_us = static_cast<double>(sum) / sorted_samples.size() / 1000.0;
+
+        return stats;
+    }
+
+private:
+    static constexpr uint32_t BUFFER_SIZE = 10000;  // Last 10k samples
+    std::array<uint64_t, BUFFER_SIZE> samples_;
+    std::atomic<uint32_t> write_idx_;
+};
+
 // Production callback for market data
 class MarketStreamCallback : public MarketDataCallbacks {
 public:
@@ -46,6 +120,13 @@ public:
         spdlog::debug("[TRADE] {}:{} @ ${:.2f} x {:.4f} {}",
                      tick.exchange.c_str(), tick.symbol.c_str(),
                      tick.price, tick.amount, tick.side.c_str());
+
+        // Record latency (receipt to callback)
+        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        uint64_t latency_ns = now_ns - tick.timestamp_ns;
+        trade_latency_.record(latency_ns);
+
         trade_count_++;
     }
 
@@ -54,19 +135,31 @@ public:
                      snapshot.exchange.c_str(), snapshot.symbol.c_str(),
                      snapshot.midpoint,
                      snapshot.relative_spread * 10000);
+
+        // Record latency (receipt to callback)
+        auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        uint64_t latency_ns = now_ns - snapshot.timestamp_ns;
+        book_latency_.record(latency_ns);
+
         book_count_++;
     }
-    
+
     void on_error(const std::string& error) override {
         spdlog::error("[ERROR] {}", error);
     }
-    
+
     uint64_t get_trade_count() const { return trade_count_.load(); }
     uint64_t get_book_count() const { return book_count_.load(); }
-    
+
+    LatencyTracker::Stats get_trade_latency_stats() { return trade_latency_.compute_stats(); }
+    LatencyTracker::Stats get_book_latency_stats() { return book_latency_.compute_stats(); }
+
 private:
     std::atomic<uint64_t> trade_count_{0};
     std::atomic<uint64_t> book_count_{0};
+    LatencyTracker trade_latency_;
+    LatencyTracker book_latency_;
 };
 
 // Parse log level from string
@@ -219,22 +312,53 @@ int main(int argc, char** argv) {
         
         // Stats loop
         auto start_time = std::chrono::steady_clock::now();
-        int stats_interval = 30; // seconds (less verbose for production)
-        
+        int stats_interval = 150; // seconds (2.5 minutes)
+
         while (!g_shutdown.load()) {
             std::this_thread::sleep_for(std::chrono::seconds(stats_interval));
-            
+
             if (!g_shutdown.load()) {
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count();
-                
-                spdlog::info("--- Stats ({}s) ---", elapsed);
-                spdlog::info("Trades: {} ({:.1f}/sec)", 
-                           callbacks->get_trade_count(),
-                           elapsed > 0 ? static_cast<double>(callbacks->get_trade_count()) / elapsed : 0.0);
-                spdlog::info("Books: {} ({:.1f}/sec)", 
-                           callbacks->get_book_count(),
-                           elapsed > 0 ? static_cast<double>(callbacks->get_book_count()) / elapsed : 0.0);
+
+                // Compute latency statistics (done in background thread, not hot path)
+                auto trade_stats = callbacks->get_trade_latency_stats();
+                auto book_stats = callbacks->get_book_latency_stats();
+
+                // Monitoring-friendly format: type=value pairs for easy parsing
+                if (trade_stats.count > 0) {
+                    spdlog::info("[LATENCY] stream=trade samples={} min_us={} p50_us={} p95_us={} p99_us={} max_us={} avg_us={:.1f} uptime_s={}",
+                               trade_stats.count,
+                               trade_stats.min_us,
+                               trade_stats.p50_us,
+                               trade_stats.p95_us,
+                               trade_stats.p99_us,
+                               trade_stats.max_us,
+                               trade_stats.avg_us,
+                               elapsed);
+                }
+
+                if (book_stats.count > 0) {
+                    spdlog::info("[LATENCY] stream=book samples={} min_us={} p50_us={} p95_us={} p99_us={} max_us={} avg_us={:.1f} uptime_s={}",
+                               book_stats.count,
+                               book_stats.min_us,
+                               book_stats.p50_us,
+                               book_stats.p95_us,
+                               book_stats.p99_us,
+                               book_stats.max_us,
+                               book_stats.avg_us,
+                               elapsed);
+                }
+
+                // Overall throughput in monitoring format
+                uint64_t total_trades = callbacks->get_trade_count();
+                uint64_t total_books = callbacks->get_book_count();
+                spdlog::info("[THROUGHPUT] trades_total={} trades_per_sec={:.1f} books_total={} books_per_sec={:.1f} uptime_s={}",
+                           total_trades,
+                           elapsed > 0 ? static_cast<double>(total_trades) / elapsed : 0.0,
+                           total_books,
+                           elapsed > 0 ? static_cast<double>(total_books) / elapsed : 0.0,
+                           elapsed);
             }
         }
         

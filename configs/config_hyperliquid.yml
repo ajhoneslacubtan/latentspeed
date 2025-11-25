@@ -18,20 +18,38 @@ log:
 feeds:
   - exchange: hyperliquid
     symbols:
-      # Hyperliquid perps use USDC as quote/collateral; normalize to BASE-USDC-PERP
+      # Top 30 by 24h volume (updated 2025-11-24 from Hyperliquid API)
       - BTC-USDC-PERP
-      # - ETH-USDC-PERP
+      - ETH-USDC-PERP
+      - HYPE-USDC-PERP
+      - SOL-USDC-PERP
+      - ZEC-USDC-PERP
+      - XRP-USDC-PERP
+      - FARTCOIN-USDC-PERP
       - ASTER-USDC-PERP
-      # - SOL-USDC-PERP
-      - AVNT-USDC-PERP
-      # - STBL-USDC-PERP
-      # - DOGE-USDC-PERP
+      - XPL-USDC-PERP
+      - TNSR-USDC-PERP
+      - PUMP-USDC-PERP
+      - SUI-USDC-PERP
+      - STRK-USDC-PERP
+      - BCH-USDC-PERP
+      - TAO-USDC-PERP
+      - DOGE-USDC-PERP
+      - MON-USDC-PERP
       - BNB-USDC-PERP
-      # - XRP-USDC-PERP
-      # - HYPE-USDC-PERP
-      # - TWT-USDC-PERP
+      - ADA-USDC-PERP
+      - UNI-USDC-PERP
+      - ENA-USDC-PERP
       - WLFI-USDC-PERP
-      # - FARTCOIN-USDC-PERP
+      - LINK-USDC-PERP
+      - AVAX-USDC-PERP
+      - AAVE-USDC-PERP
+      - NEO-USDC-PERP
+      # - kPEPE-USDC-PERP
+      # - MET-USDC-PERP
+      # - TRUMP-USDC-PERP
+      # - NEAR-USDC-PERP
+      - AVNT-USDC-PERP
     enable_trades: true
     enable_orderbook: true
     # snapshots_only is ignored when zmq.deltas.enabled=true (delta/ckpt mode)
@@ -39,4 +57,4 @@ feeds:
     snapshot_interval: 1   # seconds (legacy)
     reconnect_attempts: 10
     reconnect_delay_ms: 5000
-    # subscription_delay_ms: 250  # Increase for large symbol counts (50+) to avoid rate limits (default: 100)
+    subscription_delay_ms: 1000  # Delay between subscriptions (ms) - CRITICAL for 30+ symbols to avoid rate limits

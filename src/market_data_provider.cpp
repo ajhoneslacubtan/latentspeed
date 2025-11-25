@@ -316,12 +316,17 @@ bool MarketDataProvider::connect_websocket() {
     if (ws_stream_) {
         spdlog::debug("[MarketData] Cleaning up previous WebSocket connection");
         try {
-            ws_stream_->close(boost::beast::websocket::close_code::normal);
+            if (ws_stream_->is_open()) {
+                ws_stream_->close(boost::beast::websocket::close_code::normal);
+            }
         } catch (const std::exception& e) {
             spdlog::debug("[MarketData] Error closing previous connection: {}", e.what());
         }
         ws_stream_.reset();
     }
+
+    // Ensure ws_stream_ is fully reset
+    ws_stream_ = nullptr;
 
     // Reset io_context if stopped
     if (io_context_ && io_context_->stopped()) {
@@ -399,6 +404,19 @@ bool MarketDataProvider::connect_websocket() {
         spdlog::error("[MarketData] WebSocket connection failed: {}", e.what());
         stats_.errors.fetch_add(1);
         ws_connected_.store(false);
+
+        // Clean up failed connection to prevent segfaults
+        if (ws_stream_) {
+            try {
+                if (ws_stream_->is_open()) {
+                    ws_stream_->close(boost::beast::websocket::close_code::abnormal);
+                }
+            } catch (...) {
+                // Ignore close errors on already-failed connection
+            }
+            ws_stream_.reset();
+        }
+
         return false;
     }
 }
@@ -408,7 +426,16 @@ void MarketDataProvider::cleanup_connection() {
 
     ws_connected_.store(false);
 
-    // Cancel ping timer
+    // Stop io_context first to prevent new async operations
+    if (io_context_ && !io_context_->stopped()) {
+        io_context_->stop();
+    }
+
+    // Give a brief moment for any in-flight async operations to complete
+    // This prevents segfaults from callbacks trying to access resources we're about to destroy
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Cancel ping timer after io_context is stopped
     if (ping_timer_) {
         try {
             ping_timer_->cancel();
@@ -418,18 +445,20 @@ void MarketDataProvider::cleanup_connection() {
         ping_timer_.reset();
     }
 
-    // Close WebSocket gracefully
-    if (ws_stream_) {
-        try {
-            ws_stream_->close(boost::beast::websocket::close_code::normal);
-        } catch (const std::exception& e) {
-            spdlog::debug("[MarketData] Error closing WebSocket: {}", e.what());
+    // Close WebSocket gracefully - must hold mutex to prevent race with connect_websocket()
+    {
+        std::lock_guard<std::mutex> lock(connection_mutex_);
+        if (ws_stream_) {
+            try {
+                if (ws_stream_->is_open()) {
+                    ws_stream_->close(boost::beast::websocket::close_code::normal);
+                }
+            } catch (const std::exception& e) {
+                spdlog::debug("[MarketData] Error closing WebSocket: {}", e.what());
+            }
+            ws_stream_.reset();
+            ws_stream_ = nullptr;
         }
-    }
-
-    // Stop io_context to break out of run() loop
-    if (io_context_ && !io_context_->stopped()) {
-        io_context_->stop();
     }
 
     spdlog::debug("[MarketData] Connection cleanup complete");
@@ -454,6 +483,15 @@ uint32_t MarketDataProvider::calculate_backoff_delay(uint32_t attempt, int base_
 
 void MarketDataProvider::async_read_message() {
     if (!running_.load()) {
+        return;
+    }
+
+    // Lock mutex to safely check and use ws_stream_
+    std::lock_guard<std::mutex> lock(connection_mutex_);
+
+    // Check if ws_stream_ is valid before attempting async read
+    if (!ws_stream_ || !ws_stream_->is_open()) {
+        spdlog::debug("[MarketData] async_read_message called with invalid ws_stream_, skipping");
         return;
     }
 
@@ -536,11 +574,20 @@ void MarketDataProvider::send_ping() {
         return;
     }
 
+    // Lock mutex to safely check and use ws_stream_
+    std::lock_guard<std::mutex> lock(connection_mutex_);
+
+    // Check if ws_stream_ is valid before sending ping
+    if (!ws_stream_ || !ws_stream_->is_open()) {
+        spdlog::debug("[MarketData] Cannot send ping, WebSocket not connected");
+        return;
+    }
+
     try {
         ws_stream_->write(boost::asio::buffer(ping_msg));
 
         {
-            std::lock_guard<std::mutex> lock(ping_mutex_);
+            std::lock_guard<std::mutex> lock2(ping_mutex_);
             last_ping_time_ = std::chrono::steady_clock::now();
         }
 
@@ -564,6 +611,11 @@ void MarketDataProvider::setup_ping_timer() {
     ping_timer_->expires_after(std::chrono::seconds(ping_interval));
     ping_timer_->async_wait(
         [this, ping_interval](boost::beast::error_code ec) {
+            // If operation was cancelled, just return without doing anything
+            if (ec == boost::asio::error::operation_aborted) {
+                return;
+            }
+
             if (ec || !running_.load()) {
                 return;
             }
@@ -572,6 +624,7 @@ void MarketDataProvider::setup_ping_timer() {
             send_ping();
 
             // Check for stale connection (no messages received in 3x ping interval)
+            bool should_stop = false;
             {
                 std::lock_guard<std::mutex> lock(ping_mutex_);
                 auto now = std::chrono::steady_clock::now();
@@ -585,17 +638,23 @@ void MarketDataProvider::setup_ping_timer() {
                     if (callbacks_) {
                         callbacks_->on_error("Stale connection detected, reconnecting...");
                     }
-
-                    // Trigger reconnect by stopping io_context
-                    // This will cause io_context_->run() to return in websocket_thread()
-                    // which will then enter the reconnection loop
-                    io_context_->stop();
-                    return;  // Exit ping timer
+                    should_stop = true;
                 }
             }
 
-            // Reschedule timer
-            setup_ping_timer();
+            // Stop io_context AFTER releasing the lock and AFTER this callback completes
+            // This prevents cleanup from running while we're still in this callback
+            if (should_stop) {
+                if (io_context_ && !io_context_->stopped()) {
+                    io_context_->stop();
+                }
+                return;  // Don't reschedule timer
+            }
+
+            // Reschedule timer only if not stopping
+            if (running_.load()) {
+                setup_ping_timer();
+            }
         }
     );
 }
@@ -764,35 +823,70 @@ void MarketDataProvider::send_subscription() {
                 }
 
                 size_t count = 0;
+                size_t failed_count = 0;
                 for (auto& sub : doc.GetArray()) {
-                    rapidjson::StringBuffer buffer;
-                    rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
-                    sub.Accept(writer);
+                    try {
+                        rapidjson::StringBuffer buffer;
+                        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+                        sub.Accept(writer);
 
-                    std::string individual_sub = buffer.GetString();
-                    size_t bytes = ws_stream_->write(boost::asio::buffer(individual_sub));
+                        std::string individual_sub = buffer.GetString();
 
-                    count++;
-                    if (count % 20 == 0 || count == total_subs) {
-                        spdlog::info("[MarketData] Subscription progress: {}/{}", count, total_subs);
+                        // Check if connection is still alive before writing
+                        if (!ws_stream_ || !ws_stream_->is_open()) {
+                            throw std::runtime_error("WebSocket connection lost during subscription");
+                        }
+
+                        size_t bytes = ws_stream_->write(boost::asio::buffer(individual_sub));
+
+                        count++;
+                        if (count % 20 == 0 || count == total_subs) {
+                            spdlog::info("[MarketData] Subscription progress: {}/{}", count, total_subs);
+                        }
+
+                        spdlog::debug("[MarketData] Sent {} subscription ({} bytes): {}",
+                                    exchange_interface_->get_name(), bytes, individual_sub);
+
+                        // Configurable delay between subscriptions to avoid rate limiting
+                        std::this_thread::sleep_for(std::chrono::milliseconds(subscription_delay_ms_));
+
+                    } catch (const std::exception& e) {
+                        failed_count++;
+                        spdlog::warn("[MarketData] Failed to send subscription {}/{}: {}", count + 1, total_subs, e.what());
+
+                        // If we've sent at least some subscriptions, consider it partial success
+                        // Let the reconnection logic handle re-establishing the full connection
+                        if (count >= 5) {
+                            spdlog::warn("[MarketData] Sent {}/{} subscriptions before failure, will reconnect", count, total_subs);
+                            throw;  // Trigger reconnection
+                        } else {
+                            // Failed early, likely connection issue from the start
+                            throw;
+                        }
                     }
-
-                    spdlog::debug("[MarketData] Sent {} subscription ({} bytes): {}",
-                                exchange_interface_->get_name(), bytes, individual_sub);
-
-                    // Configurable delay between subscriptions to avoid rate limiting
-                    std::this_thread::sleep_for(std::chrono::milliseconds(subscription_delay_ms_));
                 }
-                spdlog::info("[MarketData] All {} subscriptions sent successfully", exchange_interface_->get_name());
+
+                if (failed_count > 0) {
+                    spdlog::warn("[MarketData] Completed with {} failures out of {} subscriptions", failed_count, total_subs);
+                } else {
+                    spdlog::info("[MarketData] All {} subscriptions sent successfully", exchange_interface_->get_name());
+                }
                 return;
             }
         }
-        
+
         // Standard single-message subscription (Bybit, Binance)
+        if (!ws_stream_ || !ws_stream_->is_open()) {
+            throw std::runtime_error("WebSocket connection lost before subscription");
+        }
+
         size_t bytes_written = ws_stream_->write(boost::asio::buffer(sub_msg));
         spdlog::info("[MarketData] Subscription sent successfully ({} bytes)", bytes_written);
     } catch (const std::exception& e) {
         spdlog::error("[MarketData] Failed to send subscription: {}", e.what());
+
+        // Mark connection as failed so cleanup knows the state
+        ws_connected_.store(false);
         throw;
     }
 }
